@@ -3,6 +3,7 @@ import test from "node:test";
 import { authorizationUrl, createCodeChallenge, isLocalRedirectUri } from "../extensions/oauth.ts";
 import { parseIssueReference } from "../extensions/issue-reference.ts";
 import { issueFilter } from "../extensions/issue-filter.ts";
+import { summarizeIssues } from "../extensions/issue-summary.ts";
 
 test("only accepts local HTTP OAuth redirect URIs", () => {
   assert.equal(isLocalRedirectUri("http://localhost:3000/oauth/callback"), true);
@@ -47,6 +48,19 @@ test("builds supported issue filters", () => {
     priority: { eq: 2 },
   });
   assert.deepEqual(issueFilter({}), {});
+});
+
+test("search summaries do not treat an array index as an attachment flag", async () => {
+  const issue = {
+    id: "issue-id",
+    identifier: "ENG-1",
+    title: "Example",
+    team: Promise.resolve(null),
+    state: Promise.resolve(null),
+    assignee: Promise.resolve(null),
+  };
+
+  await assert.doesNotReject(() => summarizeIssues([issue, issue]));
 });
 
 test("creates a PKCE authorization URL", () => {
