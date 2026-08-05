@@ -1,6 +1,6 @@
 import { LinearClient } from "@linear/sdk";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { keyHint, truncateHead } from "@earendil-works/pi-coding-agent";
+import { keyHint } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { Text } from "@earendil-works/pi-tui";
 import { randomBytes } from "node:crypto";
@@ -23,7 +23,10 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { spawn } from "node:child_process";
 import { issueFilter } from "./issue-filter.js";
+import { summarizeIssue, summarizeIssues } from "./issue-summary.js";
 import { parseIssueReference } from "./issue-reference.js";
+import { confirmLinearWrite, registerLinearAdminTools } from "./admin.js";
+import { jsonToolResult } from "./tool-result.js";
 
 const TOKEN_URL = "https://api.linear.app/oauth/token";
 const CALLBACK_TIMEOUT_MS = 5 * 60_000;
@@ -267,54 +270,9 @@ function renderLinearResult(
     );
 }
 
-function toolResult(value: unknown) {
-    const output = JSON.stringify(value, null, 2);
-    const truncated = truncateHead(output);
-    return {
-        content: [{ type: "text" as const, text: truncated.content }],
-        details: value,
-    };
-}
-
-async function issueSummary(issue: any, includeAttachments = false) {
-    const [team, state, assignee, attachments] = await Promise.all([
-        issue.team,
-        issue.state,
-        issue.assignee,
-        includeAttachments ? issue.attachments({ first: 50 }) : null,
-    ]);
-    return {
-        id: issue.id,
-        identifier: issue.identifier,
-        title: issue.title,
-        description: issue.description,
-        url: issue.url,
-        priority: issue.priorityLabel ?? issue.priority,
-        estimate: issue.estimate,
-        dueDate: issue.dueDate,
-        createdAt: issue.createdAt,
-        updatedAt: issue.updatedAt,
-        team: team ? { id: team.id, key: team.key, name: team.name } : null,
-        state: state
-            ? { id: state.id, name: state.name, type: state.type }
-            : null,
-        assignee: assignee
-            ? { id: assignee.id, name: assignee.name, email: assignee.email }
-            : null,
-        attachments: (attachments?.nodes ?? []).map((attachment: any) => ({
-            id: attachment.id,
-            title: attachment.title,
-            subtitle: attachment.subtitle,
-            url: attachment.url,
-            sourceType: attachment.sourceType,
-            metadata: attachment.metadata,
-            createdAt: attachment.createdAt,
-            updatedAt: attachment.updatedAt,
-        })),
-    };
-}
-
 export default function (pi: ExtensionAPI) {
+    registerLinearAdminTools(pi, authenticatedClient);
+
     pi.registerCommand("linear-login", {
         description:
             "Connect Pi to Linear with OAuth (requires LINEAR_CLIENT_ID and LINEAR_REDIRECT_URI).",
@@ -368,7 +326,7 @@ export default function (pi: ExtensionAPI) {
             const issue = await findIssue(linear, identifier);
             if (!issue)
                 throw new Error(`Linear issue not found: ${identifier}`);
-            return toolResult(await issueSummary(issue, true));
+            return jsonToolResult(await summarizeIssue(issue));
         },
         renderResult(result, options, theme) {
             const issue = result.details as
@@ -448,10 +406,8 @@ export default function (pi: ExtensionAPI) {
             const results: any = query
                 ? await linear.searchIssues(query, { first: limit, filter })
                 : await linear.issues({ first: limit, filter });
-            return toolResult({
-                nodes: await Promise.all(
-                    (results.nodes ?? []).map(issueSummary),
-                ),
+            return jsonToolResult({
+                nodes: await summarizeIssues(results.nodes ?? []),
             });
         },
         renderResult(result, options, theme) {
@@ -481,23 +437,31 @@ export default function (pi: ExtensionAPI) {
                 description:
                     "Linear issue UUID, identifier such as ENG-123, or Linear issue URL",
             }),
-            body: Type.String({ description: "Markdown comment body to post" }),
+            body: Type.String({ description: "Markdown comment body to post", maxLength: 10_000 }),
         }),
-        async execute(_id, { identifier, body }) {
+        async execute(_id, { identifier, body }, _signal, _onUpdate, ctx) {
             const linear = await authenticatedClient();
             const issue = await findIssue(linear, identifier);
             if (!issue)
                 throw new Error(`Linear issue not found: ${identifier}`);
+            await confirmLinearWrite(ctx, "Post Linear comment?", {
+                issueId: issue.id,
+                issueIdentifier: issue.identifier,
+                body,
+            });
             const result: any = await linear.createComment({
                 issueId: issue.id,
                 body,
             });
-            if (!result.success || !result.comment)
-                throw new Error("Linear did not create the comment.");
-            return toolResult({
-                id: result.comment.id,
-                body: result.comment.body,
-                createdAt: result.comment.createdAt,
+            const comment: any = await result?.comment;
+            if (
+                !result?.success || !comment || comment.body !== body ||
+                comment.issueId !== issue.id
+            ) throw new Error("Linear comment creation did not produce exact readback.");
+            return jsonToolResult({
+                id: comment.id,
+                body: comment.body,
+                createdAt: comment.createdAt,
                 issue: identifier,
             });
         },
