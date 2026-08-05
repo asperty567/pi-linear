@@ -7,8 +7,9 @@ A [Pi](https://github.com/badlogic/pi-mono) package that connects Pi to Linear t
 - posting a comment (`linear_comment_issue`)
 - listing teams and workflow states (`linear_list_teams`)
 - searching users without exposing email addresses (`linear_search_users`)
+- setting up a private team and all requested workflow states from one plan confirmation (`linear_setup_private_team`)
 - creating private teams and managing verified owners (`linear_create_team`, `linear_add_team_owner`, `linear_remove_team_member`)
-- creating, updating, and archiving workflow states (`linear_create_workflow_state`, `linear_update_workflow_state`, `linear_archive_workflow_state`)
+- creating, updating, and archiving individual workflow states (`linear_create_workflow_state`, `linear_update_workflow_state`, `linear_archive_workflow_state`)
 - archiving an empty team (`linear_archive_empty_team`)
 
 Workspace mutation tools require a stable command ID, exact user approval, preflight identity checks, and authoritative readback. Destructive tools refuse non-empty states or teams and refuse to remove the last team owner.

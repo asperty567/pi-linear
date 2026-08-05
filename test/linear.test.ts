@@ -86,6 +86,7 @@ test("registers bounded Linear workspace administration tools", async () => {
   assert.deepEqual([...tools.keys()], [
     "linear_list_teams",
     "linear_search_users",
+    "linear_setup_private_team",
     "linear_create_team",
     "linear_add_team_owner",
     "linear_remove_team_member",
@@ -124,6 +125,128 @@ test("registers bounded Linear workspace administration tools", async () => {
     }),
     /already exists with conflicting settings/,
   );
+});
+
+test("sets up a private team and requested workflow states with one confirmation", async () => {
+  const tools = new Map<string, any>();
+  const teams: any[] = [];
+  let confirmations = 0;
+  let teamWrites = 0;
+  let stateWrites = 0;
+  const client = {
+    organization: Promise.resolve({ id: "workspace-1" }),
+    async teams({ filter }: any) {
+      const key = filter?.key?.eq;
+      return { nodes: key ? teams.filter((team) => team.key === key) : teams };
+    },
+    async createTeam(input: any) {
+      teamWrites += 1;
+      const team = makeTeam({
+        ...input,
+        states: [{ id: "linear-default-done", teamId: input.id, name: "Done", type: "completed", color: "#000000", position: 99, archivedAt: null }],
+      });
+      teams.push(team);
+      return { success: true };
+    },
+    async createWorkflowState(input: any) {
+      stateWrites += 1;
+      const team = teams.find((candidate) => candidate.id === input.teamId);
+      team._states.push({ ...input, archivedAt: null });
+      throw new Error("simulated ambiguous create result");
+    },
+    async updateWorkflowState(id: string, input: any) {
+      stateWrites += 1;
+      const state = teams.flatMap((team) => team._states).find((candidate) => candidate.id === id);
+      Object.assign(state, input);
+      return { success: true };
+    },
+  };
+  registerLinearAdminTools(testPi(tools, () => { confirmations += 1; }), async () => client as any);
+  const plan = {
+    commandId: "company-task-team-plan-1",
+    expectedWorkspaceId: "workspace-1",
+    name: "Company Tasks",
+    key: "TASK",
+    states: [
+      { name: "Triage", type: "backlog", color: "#5E6AD2", position: 10 },
+      { name: "Done", type: "completed", color: "#26B5CE", position: 20 },
+    ],
+  };
+  const first = await tools.get("linear_setup_private_team").execute("call-setup-1", plan);
+  assert.equal(first.details.teamCreated, true);
+  assert.equal(first.details.statesCreated, 1);
+  assert.equal(first.details.statesUpdated, 1);
+  assert.equal(first.details.recoveredAfterAmbiguousResult, true);
+  assert.equal(confirmations, 1);
+  assert.equal(teamWrites, 1);
+  assert.equal(stateWrites, 2);
+
+  const retry = await tools.get("linear_setup_private_team").execute("call-setup-2", plan);
+  assert.equal(retry.details.idempotent, true);
+  assert.equal(confirmations, 1);
+  assert.equal(teamWrites, 1);
+  assert.equal(stateWrites, 2);
+
+  teams[0]._states.find((state: any) => state.id === "linear-default-done").name = "done";
+  await assert.rejects(
+    tools.get("linear_setup_private_team").execute("call-setup-3", plan),
+    /conflicting letter case/,
+  );
+  assert.equal(confirmations, 1);
+  assert.equal(stateWrites, 2);
+});
+
+test("batch setup rejects a mismatched team key readback", async () => {
+  const tools = new Map<string, any>();
+  const wrongTeam = makeTeam({
+    id: "be720a07-68a4-4f73-abe1-232c86d0006e",
+    name: "Company Tasks",
+    key: "WRONG",
+    private: true,
+  });
+  Object.assign(wrongTeam, {
+    triageEnabled: true,
+    cyclesEnabled: false,
+    description: "First harness-neutral company Task cohort.",
+  });
+  const client = {
+    organization: Promise.resolve({ id: "workspace-1" }),
+    async teams() { return { nodes: [wrongTeam] }; },
+  };
+  registerLinearAdminTools(testPi(tools), async () => client as any);
+  await assert.rejects(
+    tools.get("linear_setup_private_team").execute("call-wrong-key", {
+      commandId: "company-task-team-plan-1",
+      expectedWorkspaceId: "workspace-1",
+      name: "Company Tasks",
+      key: "TASK",
+      states: [{ name: "Triage", type: "backlog", color: "#5E6AD2", position: 10 }],
+    }),
+    /conflicting settings or command identity/,
+  );
+});
+
+test("declining a batch setup plan performs no writes", async () => {
+  const tools = new Map<string, any>();
+  let writes = 0;
+  const client = {
+    organization: Promise.resolve({ id: "workspace-1" }),
+    async teams() { return { nodes: [] }; },
+    async createTeam() { writes += 1; return { success: true }; },
+    async createWorkflowState() { writes += 1; return { success: true }; },
+  };
+  registerLinearAdminTools({ registerTool(tool: any) { tools.set(tool.name, tool); } } as any, async () => client as any);
+  await assert.rejects(
+    tools.get("linear_setup_private_team").execute("call-decline", {
+      commandId: "declined-team-plan",
+      expectedWorkspaceId: "workspace-1",
+      name: "Company Tasks",
+      key: "TASK",
+      states: [{ name: "Triage", type: "backlog", color: "#5E6AD2", position: 10 }],
+    }, undefined, undefined, { hasUI: true, ui: { confirm: async () => false } }),
+    /was not approved/,
+  );
+  assert.equal(writes, 0);
 });
 
 test("workspace writes fail closed without interactive one-use confirmation", async () => {
@@ -329,13 +452,13 @@ test("archives only exact empty workflow states and command-created teams", asyn
   assert.equal(archivedTeam.details.archived, true);
 });
 
-function testPi(tools: Map<string, any>) {
+function testPi(tools: Map<string, any>, onConfirm: () => void = () => {}) {
   return {
     registerTool(tool: any) {
       const execute = tool.execute.bind(tool);
       tool.execute = (id: string, input: unknown) => execute(id, input, undefined, undefined, {
         hasUI: true,
-        ui: { confirm: async () => true },
+        ui: { confirm: async () => { onConfirm(); return true; } },
       });
       tools.set(tool.name, tool);
     },
@@ -350,6 +473,7 @@ function makeTeam(input: { id: string; name: string; key: string; private: boole
     ledInitiativeCount: 0,
     archivedAt: null,
     organization: Promise.resolve({ id: "workspace-1" }),
+    _states: states,
     async states() { return { nodes: states, pageInfo: { hasNextPage: false } }; },
   };
 }

@@ -162,6 +162,16 @@ async function matchingState(team: TeamLike, stateName: string): Promise<Workflo
   return matches[0];
 }
 
+async function exactNamedState(team: TeamLike, stateName: string): Promise<WorkflowStateLike | undefined> {
+  const states = await statesFor(team);
+  const matches = states.filter((state) => state.name === stateName);
+  if (matches.length > 1) throw new Error(`Linear team has duplicate exact workflow states named ${stateName}.`);
+  if (!matches.length && states.some((state) => state.name.toLowerCase() === stateName.toLowerCase())) {
+    throw new Error(`Linear workflow state ${stateName} has conflicting letter case.`);
+  }
+  return matches[0];
+}
+
 async function stateById(team: TeamLike, stateId: string): Promise<WorkflowStateLike> {
   const state = (await statesFor(team)).find((candidate) => candidate.id === stateId);
   if (!state) throw new Error(`Linear workflow state ${stateId} is not active in team ${team.id}.`);
@@ -216,6 +226,146 @@ export function registerLinearAdminTools(pi: ExtensionAPI, getClient: ClientFact
   });
 
   pi.registerTool({
+    name: "linear_setup_private_team",
+    label: "Linear Setup Private Team",
+    description: "Create one private Linear team and ensure its requested workflow states from one exact, interactive plan confirmation. Retries are idempotent and every result is reread. External workspace writes; requires /linear-login.",
+    promptSnippet: "Set up a private Linear team and workflow with one confirmation",
+    promptGuidelines: ["Prefer linear_setup_private_team for initial team setup so the user confirms the complete team-and-workflow plan once instead of confirming each state separately."],
+    parameters: Type.Object({
+      commandId: Type.String({ description: "Stable command ID for the requested setup plan" }),
+      expectedWorkspaceId: Type.String({ description: "Exact Linear workspace UUID" }),
+      name: Type.String({ description: "Private team name" }),
+      key: Type.String({ description: "2-10 character uppercase team key" }),
+      states: Type.Array(Type.Object({
+        name: Type.String({ description: "Workflow state name" }),
+        type: Type.String({ description: "backlog, unstarted, started, completed, or canceled" }),
+        color: Type.String({ description: "Six-digit hex color" }),
+        position: Type.Number({ minimum: 0, maximum: 1000 }),
+      }), { minItems: 1, maxItems: 20 }),
+    }),
+    async execute(_id, input, _signal, _onUpdate, ctx) {
+      const id = commandId(input.commandId);
+      const expectedTeam = {
+        id: deterministicUuid("create-team", id),
+        name: name(input.name, "Linear team name"),
+        key: teamKey(input.key),
+        private: true,
+        triageEnabled: true,
+        cyclesEnabled: false,
+        description: "First harness-neutral company Task cohort.",
+      };
+      const seenNames = new Set<string>();
+      const expectedStates = input.states.map((candidate) => {
+        const stateName = name(candidate.name, "Linear workflow state name");
+        const foldedName = stateName.toLocaleLowerCase("en-US");
+        if (seenNames.has(foldedName)) throw new Error(`Duplicate Linear workflow state name: ${stateName}`);
+        seenNames.add(foldedName);
+        const stateCommandId = `${id}:state:${stateName}`;
+        return {
+          commandId: stateCommandId,
+          id: deterministicUuid("create-workflow-state", stateCommandId),
+          name: stateName,
+          type: workflowType(candidate.type),
+          color: color(candidate.color),
+          position: candidate.position,
+        };
+      });
+      const client = await getClient();
+      await requireWorkspace(client, input.expectedWorkspaceId);
+      const exactTeam = (team: TeamLike) =>
+        team.id === expectedTeam.id && team.name === expectedTeam.name && team.key === expectedTeam.key && team.private === true &&
+        team.triageEnabled === true && team.cyclesEnabled === false && team.description === expectedTeam.description;
+      let team = await findTeam(client, expectedTeam.key);
+      let needsStateWrites = true;
+      if (team) {
+        await requireTeamWorkspace(team, input.expectedWorkspaceId);
+        if (!exactTeam(team) || team.archivedAt) throw new Error(`Linear team ${expectedTeam.key} already exists with conflicting settings or command identity.`);
+        needsStateWrites = false;
+        for (const expected of expectedStates) {
+          const existing = await exactNamedState(team, expected.name);
+          if (existing && existing.type !== expected.type) throw new Error(`Linear workflow state ${expected.name} has a conflicting type.`);
+          if (!existing || existing.color.toUpperCase() !== expected.color || existing.position !== expected.position) needsStateWrites = true;
+        }
+      }
+      const willCreateTeam = !team;
+      if (!willCreateTeam && !needsStateWrites) {
+        const states = [];
+        for (const expected of expectedStates) states.push(summarizeState((await exactNamedState(team!, expected.name))!));
+        return result({ commandId: id, changed: false, idempotent: true, team: await summarizeTeam(team!), states });
+      }
+      await confirmWrite(ctx, "Set up private Linear team and requested workflow states?", {
+        commandId: id,
+        workspaceId: input.expectedWorkspaceId,
+        team: expectedTeam,
+        states: expectedStates,
+        stateResolution: "Adopt an exact-name state only when its type matches, then set its approved color and position; otherwise create the deterministic state ID.",
+      });
+
+      // Refresh authority after the user has reviewed the plan. A concurrent conflict must stop before a write.
+      await requireWorkspace(client, input.expectedWorkspaceId);
+      team = await findTeam(client, expectedTeam.key);
+      let teamCreated = false;
+      let teamFailure: unknown;
+      if (team) {
+        await requireTeamWorkspace(team, input.expectedWorkspaceId);
+        if (!exactTeam(team) || team.archivedAt) throw new Error(`Linear team ${expectedTeam.key} changed during confirmation.`);
+      } else {
+        try {
+          const payload: any = await client.createTeam(expectedTeam);
+          if (!payload?.success) throw new Error("Linear did not create the team.");
+          teamCreated = true;
+        } catch (error) { teamFailure = error; }
+        team = await findTeam(client, expectedTeam.key);
+        if (team) await requireTeamWorkspace(team, input.expectedWorkspaceId);
+        if (!team || !exactTeam(team)) throw new Error("Linear team setup did not produce exact readback.", { cause: teamFailure });
+      }
+
+      const stateResults: any[] = [];
+      let statesCreated = 0;
+      let statesUpdated = 0;
+      let recoveredStateResult = false;
+      for (const expected of expectedStates) {
+        let state = await exactNamedState(team, expected.name);
+        if (state && state.type !== expected.type) throw new Error(`Linear workflow state ${expected.name} has a conflicting type.`);
+        let stateFailure: unknown;
+        if (!state) {
+          try {
+            const { commandId: _stateCommandId, ...stateInput } = expected;
+            const payload: any = await client.createWorkflowState({ teamId: team.id, ...stateInput });
+            if (!payload?.success) throw new Error("Linear did not create the workflow state.");
+          } catch (error) { stateFailure = error; }
+          state = await exactNamedState(team, expected.name);
+          if (!state || state.id !== expected.id) throw new Error(`Linear workflow state ${expected.name} creation did not produce exact identity readback.`, { cause: stateFailure });
+          statesCreated += 1;
+        } else if (state.color.toUpperCase() !== expected.color || state.position !== expected.position) {
+          try {
+            const payload: any = await client.updateWorkflowState(state.id, { color: expected.color, position: expected.position });
+            if (!payload?.success) throw new Error("Linear did not update the adopted workflow state.");
+          } catch (error) { stateFailure = error; }
+          state = await exactNamedState(team, expected.name);
+          statesUpdated += 1;
+        }
+        recoveredStateResult ||= Boolean(stateFailure && state);
+        if (
+          !state || state.name !== expected.name || state.type !== expected.type ||
+          state.color.toUpperCase() !== expected.color || state.position !== expected.position
+        ) throw new Error(`Linear workflow state ${expected.name} did not produce exact readback.`, { cause: stateFailure });
+        stateResults.push(summarizeState(state));
+      }
+      return result({
+        commandId: id,
+        changed: true,
+        teamCreated,
+        statesCreated,
+        statesUpdated,
+        recoveredAfterAmbiguousResult: Boolean(teamFailure) || recoveredStateResult,
+        team: await summarizeTeam(team),
+        states: stateResults,
+      });
+    },
+  });
+
+  pi.registerTool({
     name: "linear_create_team",
     label: "Linear Create Team",
     description: "Create one private Linear team with fixed safe defaults, deterministic retry identity, conflict checks, and authoritative readback. External workspace write. Requires exact user approval and /linear-login.",
@@ -241,7 +391,7 @@ export function registerLinearAdminTools(pi: ExtensionAPI, getClient: ClientFact
       const client = await getClient();
       await requireWorkspace(client, input.expectedWorkspaceId);
       const exact = (team: TeamLike) =>
-        team.id === expected.id && team.name === expected.name && team.private === true &&
+        team.id === expected.id && team.name === expected.name && team.key === expected.key && team.private === true &&
         team.triageEnabled === true && team.cyclesEnabled === false && team.description === expected.description;
       const existing = await findTeam(client, expected.key);
       if (existing) {
@@ -347,7 +497,7 @@ export function registerLinearAdminTools(pi: ExtensionAPI, getClient: ClientFact
       ) throw new Error("Linear human user identity is unavailable or changed.");
       const team = await getTeam(client, input.teamId, input.expectedWorkspaceId);
       let memberships = await membershipsFor(team);
-      const membership = memberships.find((candidate) => candidate.userId === input.userId);
+      let membership = memberships.find((candidate) => candidate.userId === input.userId);
       if (!membership) return result({ commandId: id, removed: false, idempotent: true, userId: input.userId });
       if (membership.owner !== input.expectedOwner) throw new Error("Linear team membership owner flag changed before removal.");
       if (membership.owner && memberships.filter((candidate) => candidate.owner).length < 2) throw new Error("Linear refused to remove the last team owner.");
@@ -355,6 +505,11 @@ export function registerLinearAdminTools(pi: ExtensionAPI, getClient: ClientFact
         commandId: id, workspaceId: input.expectedWorkspaceId, teamId: team.id,
         userId: user.id, userName: user.name, membershipId: membership.id, currentOwner: membership.owner,
       });
+      memberships = await membershipsFor(team);
+      membership = memberships.find((candidate) => candidate.userId === input.userId);
+      if (!membership) return result({ commandId: id, removed: false, idempotent: true, userId: input.userId });
+      if (membership.owner !== input.expectedOwner) throw new Error("Linear team membership owner flag changed during confirmation.");
+      if (membership.owner && memberships.filter((candidate) => candidate.owner).length < 2) throw new Error("Linear refused to remove the last team owner after confirmation.");
       let failure: unknown;
       try {
         const payload: any = await client.deleteTeamMembership(membership.id);
@@ -482,9 +637,14 @@ export function registerLinearAdminTools(pi: ExtensionAPI, getClient: ClientFact
         commandId: id, workspaceId: input.expectedWorkspaceId, teamId: team.id,
         stateId: before.id, current: expectedSnapshot, requested: patch,
       });
+      const freshBefore = await stateById(team, before.id);
+      if (
+        freshBefore.name !== expectedSnapshot.name || freshBefore.type !== expectedSnapshot.type ||
+        freshBefore.color.toUpperCase() !== expectedSnapshot.color || freshBefore.position !== expectedSnapshot.position
+      ) throw new Error("Linear workflow state changed during confirmation.");
       let failure: unknown;
       try {
-        const payload: any = await client.updateWorkflowState(before.id, patch);
+        const payload: any = await client.updateWorkflowState(freshBefore.id, patch);
         if (!payload?.success) throw new Error("Linear did not update the workflow state.");
       } catch (error) { failure = error; }
       const after = await stateById(team, before.id);
@@ -519,7 +679,7 @@ export function registerLinearAdminTools(pi: ExtensionAPI, getClient: ClientFact
       const client = await getClient();
       await requireWorkspace(client, input.expectedWorkspaceId);
       await getTeam(client, input.teamId, input.expectedWorkspaceId);
-      const state: any = await client.workflowState(input.stateId);
+      let state: any = await client.workflowState(input.stateId);
       if (!state || state.teamId !== input.teamId) throw new Error("Linear workflow state is unavailable or belongs to another team.");
       if (
         state.name !== name(input.expectedName, "Expected workflow state name") ||
@@ -535,6 +695,16 @@ export function registerLinearAdminTools(pi: ExtensionAPI, getClient: ClientFact
         commandId: id, workspaceId: input.expectedWorkspaceId, teamId: input.teamId,
         state: summarizeState(state), destructive: true,
       });
+      state = await client.workflowState(input.stateId);
+      if (
+        !state || state.teamId !== input.teamId || state.archivedAt ||
+        state.name !== name(input.expectedName, "Expected workflow state name") || state.type !== workflowType(input.expectedType) ||
+        state.color.toUpperCase() !== color(input.expectedColor) || state.position !== input.expectedPosition
+      ) throw new Error("Linear workflow state changed during confirmation.");
+      if (typeof state.issues !== "function") throw new Error("Linear workflow state issue inventory is unavailable after confirmation.");
+      const freshIssues = await state.issues({ first: 1, includeArchived: true });
+      if (!Array.isArray(freshIssues.nodes) || freshIssues.pageInfo?.hasNextPage !== false) throw new Error("Linear workflow state issue inventory is incomplete after confirmation.");
+      if (freshIssues.nodes.length > 0) throw new Error("Linear workflow state gained issues during confirmation and cannot be archived safely.");
       let failure: unknown;
       try {
         const payload: any = await client.archiveWorkflowState(state.id);
@@ -569,7 +739,7 @@ export function registerLinearAdminTools(pi: ExtensionAPI, getClient: ClientFact
       const originalId = commandId(input.createCommandId);
       const client = await getClient();
       await requireWorkspace(client, input.expectedWorkspaceId);
-      const direct: any = await client.team(input.teamId);
+      let direct: any = await client.team(input.teamId);
       if (direct) await requireTeamWorkspace(direct, input.expectedWorkspaceId);
       if (!direct || direct.id !== deterministicUuid("create-team", originalId)) throw new Error("Linear team was not created by the approved command identity.");
       if (direct.name !== name(input.expectedName, "Expected Linear team name") || direct.key !== teamKey(input.expectedKey) || !direct.private) {
@@ -588,6 +758,21 @@ export function registerLinearAdminTools(pi: ExtensionAPI, getClient: ClientFact
         commandId: id, createCommandId: originalId, workspaceId: input.expectedWorkspaceId,
         teamId: direct.id, name: direct.name, key: direct.key, destructive: true,
       });
+      direct = await client.team(input.teamId);
+      if (direct) await requireTeamWorkspace(direct, input.expectedWorkspaceId);
+      if (
+        !direct || direct.archivedAt || direct.id !== deterministicUuid("create-team", originalId) ||
+        direct.name !== name(input.expectedName, "Expected Linear team name") ||
+        direct.key !== teamKey(input.expectedKey) || !direct.private
+      ) throw new Error("Linear team identity changed during confirmation.");
+      if (typeof direct.issues !== "function" || typeof direct.projects !== "function") throw new Error("Linear team resource inventory is unavailable after confirmation.");
+      const freshTeamIssues: any = await direct.issues({ first: 1, includeArchived: true });
+      const freshTeamProjects: any = await direct.projects({ first: 1, includeArchived: true });
+      if (!Array.isArray(freshTeamIssues.nodes) || freshTeamIssues.pageInfo?.hasNextPage !== false || typeof direct.issueCount !== "number") throw new Error("Linear team issue inventory is incomplete after confirmation.");
+      if (!Array.isArray(freshTeamProjects.nodes) || freshTeamProjects.pageInfo?.hasNextPage !== false) throw new Error("Linear team project inventory is incomplete after confirmation.");
+      if (freshTeamIssues.nodes.length || direct.issueCount !== 0 || freshTeamProjects.nodes.length || direct.ledInitiativeCount !== 0) {
+        throw new Error("Linear team gained resources during confirmation and cannot be archived safely.");
+      }
       let failure: unknown;
       try {
         const payload: any = await client.deleteTeam(direct.id);
