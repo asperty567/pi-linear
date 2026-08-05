@@ -69,7 +69,7 @@ test("registers bounded Linear workspace administration tools", async () => {
   const teams: any[] = [];
   let createCalls = 0;
   const client = {
-    organization: Promise.resolve({ id: "workspace-1", name: "Workspace", urlKey: "workspace" }),
+    organization: Promise.resolve(businessWorkspace({ name: "Workspace", urlKey: "workspace" })),
     async teams({ filter }: any) {
       const key = filter?.key?.eq;
       return { nodes: key ? teams.filter((team) => team.key === key) : teams };
@@ -134,7 +134,7 @@ test("sets up a private team and requested workflow states with one confirmation
   let teamWrites = 0;
   let stateWrites = 0;
   const client = {
-    organization: Promise.resolve({ id: "workspace-1" }),
+    organization: Promise.resolve(businessWorkspace()),
     async teams({ filter }: any) {
       const key = filter?.key?.eq;
       return { nodes: key ? teams.filter((team) => team.key === key) : teams };
@@ -210,7 +210,7 @@ test("batch setup rejects a mismatched team key readback", async () => {
     description: "First harness-neutral company Task cohort.",
   });
   const client = {
-    organization: Promise.resolve({ id: "workspace-1" }),
+    organization: Promise.resolve(businessWorkspace()),
     async teams() { return { nodes: [wrongTeam] }; },
   };
   registerLinearAdminTools(testPi(tools), async () => client as any);
@@ -226,11 +226,35 @@ test("batch setup rejects a mismatched team key readback", async () => {
   );
 });
 
+test("private-team setup rejects unsupported plans before confirmation", async () => {
+  const tools = new Map<string, any>();
+  let confirmations = 0;
+  let writes = 0;
+  const client = {
+    organization: Promise.resolve({ id: "workspace-1", subscription: Promise.resolve(null) }),
+    async teams() { return { nodes: [] }; },
+    async createTeam() { writes += 1; return { success: true }; },
+  };
+  registerLinearAdminTools(testPi(tools, () => { confirmations += 1; }), async () => client as any);
+  await assert.rejects(
+    tools.get("linear_setup_private_team").execute("call-free-plan", {
+      commandId: "free-plan-team",
+      expectedWorkspaceId: "workspace-1",
+      name: "Company Tasks",
+      key: "TASK",
+      states: [{ name: "Triage", type: "backlog", color: "#5E6AD2", position: 10 }],
+    }),
+    /private teams require Business or Enterprise.*on free/,
+  );
+  assert.equal(confirmations, 0);
+  assert.equal(writes, 0);
+});
+
 test("declining a batch setup plan performs no writes", async () => {
   const tools = new Map<string, any>();
   let writes = 0;
   const client = {
-    organization: Promise.resolve({ id: "workspace-1" }),
+    organization: Promise.resolve(businessWorkspace()),
     async teams() { return { nodes: [] }; },
     async createTeam() { writes += 1; return { success: true }; },
     async createWorkflowState() { writes += 1; return { success: true }; },
@@ -253,7 +277,7 @@ test("workspace writes fail closed without interactive one-use confirmation", as
   const tools = new Map<string, any>();
   let createCalls = 0;
   const client = {
-    organization: Promise.resolve({ id: "workspace-1" }),
+    organization: Promise.resolve(businessWorkspace()),
     async teams() { return { nodes: [] }; },
     async createTeam() { createCalls += 1; return { success: true }; },
   };
@@ -392,7 +416,7 @@ test("archives only exact empty workflow states and command-created teams", asyn
     async issues() { return { nodes: [], pageInfo: { hasNextPage: false } }; },
   };
   const client = {
-    organization: Promise.resolve({ id: "workspace-1" }),
+    organization: Promise.resolve(businessWorkspace()),
     async teams({ filter }: any) {
       const key = filter?.key?.eq;
       return { nodes: key ? teams.filter((candidate) => candidate.key === key) : teams };
@@ -451,6 +475,10 @@ test("archives only exact empty workflow states and command-created teams", asyn
   });
   assert.equal(archivedTeam.details.archived, true);
 });
+
+function businessWorkspace(extra: Record<string, unknown> = {}) {
+  return { id: "workspace-1", subscription: Promise.resolve({ type: "business" }), ...extra };
+}
 
 function testPi(tools: Map<string, any>, onConfirm: () => void = () => {}) {
   return {

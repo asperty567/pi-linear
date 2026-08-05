@@ -57,10 +57,20 @@ function deterministicUuid(operation: string, stableCommandId: string): string {
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
-async function requireWorkspace(client: LinearClient, expectedWorkspaceId: string): Promise<void> {
+async function requireWorkspace(client: LinearClient, expectedWorkspaceId: string): Promise<any> {
   const workspace: any = await client.organization;
   if (!workspace || workspace.id !== expectedWorkspaceId) {
     throw new Error(`Linear workspace conflict: expected ${expectedWorkspaceId}, current ${workspace?.id ?? "unavailable"}.`);
+  }
+  return workspace;
+}
+
+async function requirePrivateTeamCapability(client: LinearClient, expectedWorkspaceId: string): Promise<void> {
+  const workspace = await requireWorkspace(client, expectedWorkspaceId);
+  const subscription: any = await workspace.subscription;
+  const plan = String(subscription?.type ?? "free").toLowerCase();
+  if (plan !== "business" && plan !== "enterprise") {
+    throw new Error(`Linear private teams require Business or Enterprise; workspace ${expectedWorkspaceId} is on ${plan}.`);
   }
 }
 
@@ -271,7 +281,7 @@ export function registerLinearAdminTools(pi: ExtensionAPI, getClient: ClientFact
         };
       });
       const client = await getClient();
-      await requireWorkspace(client, input.expectedWorkspaceId);
+      await requirePrivateTeamCapability(client, input.expectedWorkspaceId);
       const exactTeam = (team: TeamLike) =>
         team.id === expectedTeam.id && team.name === expectedTeam.name && team.key === expectedTeam.key && team.private === true &&
         team.triageEnabled === true && team.cyclesEnabled === false && team.description === expectedTeam.description;
@@ -302,7 +312,7 @@ export function registerLinearAdminTools(pi: ExtensionAPI, getClient: ClientFact
       });
 
       // Refresh authority after the user has reviewed the plan. A concurrent conflict must stop before a write.
-      await requireWorkspace(client, input.expectedWorkspaceId);
+      await requirePrivateTeamCapability(client, input.expectedWorkspaceId);
       team = await findTeam(client, expectedTeam.key);
       let teamCreated = false;
       let teamFailure: unknown;
@@ -389,7 +399,7 @@ export function registerLinearAdminTools(pi: ExtensionAPI, getClient: ClientFact
         description: "First harness-neutral company Task cohort.",
       };
       const client = await getClient();
-      await requireWorkspace(client, input.expectedWorkspaceId);
+      await requirePrivateTeamCapability(client, input.expectedWorkspaceId);
       const exact = (team: TeamLike) =>
         team.id === expected.id && team.name === expected.name && team.key === expected.key && team.private === true &&
         team.triageEnabled === true && team.cyclesEnabled === false && team.description === expected.description;
@@ -405,6 +415,13 @@ export function registerLinearAdminTools(pi: ExtensionAPI, getClient: ClientFact
         name: expected.name, key: expected.key, private: true, triageEnabled: true, cyclesEnabled: false,
         description: expected.description,
       });
+      await requirePrivateTeamCapability(client, input.expectedWorkspaceId);
+      const concurrent = await findTeam(client, expected.key);
+      if (concurrent) {
+        await requireTeamWorkspace(concurrent, input.expectedWorkspaceId);
+        if (!exact(concurrent) || concurrent.archivedAt) throw new Error(`Linear team ${expected.key} changed during confirmation.`);
+        return result({ commandId: id, created: false, idempotent: true, team: await summarizeTeam(concurrent) });
+      }
       let failure: unknown;
       try {
         const payload: any = await client.createTeam(expected);
